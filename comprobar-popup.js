@@ -10,7 +10,7 @@ const URL_INICIAL = "https://www.siisa.com.co";
 // Los PDF tienen datos clínicos: se guardan FUERA de OneDrive.
 const CARPETA_BASE = path.join(os.homedir(), "SIISA_descargas");
 const MAX_DOCUMENTOS = 200; // tope de seguridad por paciente
-const MAX_PAGINAS_POR_CARPETA = 30;
+const MAX_PAGINAS_POR_CARPETA = 300;
 const ESPERA_CAMBIO_MS = 6000;
 
 // "doble" = doble clic rápido | "dos" = dos clics separados con una pausa
@@ -73,7 +73,7 @@ const MODO_CLIC = "dos";
   async function conReintentos(fn, intentos = 3, esperaMs = 2000) {
     let ultimo;
     for (let i = 1; i <= intentos; i++) {
-      try {
+      try {122  
         return await fn();
       } catch (e) {
         ultimo = e;
@@ -413,10 +413,64 @@ const MODO_CLIC = "dos";
     return null;
   }
 
+  // Clic en el ícono "Visualizar" de una fila. Prueba varias vías porque en
+  // algunas carpetas (p. ej. "Consentimientos Informados") el ícono está
+  // cubierto o solo aparece al pasar el mouse por la fila.
+  async function clicEnPdf(pagina, icono) {
+    // 1) Hover de la fila (revela íconos que aparecen solo al pasar el mouse)
+    //    y clic normal.
+    const fila = icono.locator("xpath=ancestor::tr[1]");
+    await fila.hover({ timeout: 3000 }).catch(() => {});
+    await pagina.waitForTimeout(250);
+    try {
+      await icono.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      await icono.click({ timeout: 5000 });
+      return;
+    } catch {}
+
+    // 2) Clic forzado (ignora que otro elemento cubra el ícono).
+    try {
+      await icono.click({ force: true, timeout: 3000 });
+      return;
+    } catch {}
+
+    // 3) Evento click directo sobre el nodo (siempre funciona aunque esté oculto).
+    try {
+      await icono.dispatchEvent("click", {}, { timeout: 3000 });
+      return;
+    } catch (e) {
+      const d = await icono
+        .evaluate((el) => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          const encima = document.elementFromPoint(
+            r.x + r.width / 2,
+            r.y + r.height / 2
+          );
+          return {
+            etiqueta: el.tagName.toLowerCase(),
+            ancho: Math.round(r.width),
+            alto: Math.round(r.height),
+            display: s.display,
+            visibilidad: s.visibility,
+            opacidad: s.opacity,
+            elementoEncima: encima
+              ? encima.tagName.toLowerCase() +
+                (encima.className ? "." + encima.className : "")
+              : null,
+          };
+        })
+        .catch(() => null);
+      throw new Error(
+        "No pude hacer clic en el ícono. Diagnóstico: " + JSON.stringify(d)
+      );
+    }
+  }
+
   async function guardarPdfDeFila(pagina, icono, rutaArchivo) {
     await pagina.bringToFront();
-    const espera = context.waitForEvent("page", { timeout: 15000 }).catch(() => null);
-    await icono.click({ timeout: 10000 });
+    const espera = context.waitForEvent("page", { timeout: 20000 }).catch(() => null);
+    await clicEnPdf(pagina, icono);
     const nueva = await espera;
     if (!nueva) throw new Error("El clic no abrió una pestaña nueva.");
     try {
@@ -589,14 +643,130 @@ const MODO_CLIC = "dos";
     return null;
   }
 
+  // Devuelve el cuadro de búsqueda si la pantalla es la correcta. Si la pestaña
+  // quedó en el Histórico del paciente anterior (cuando NO se abrió en una
+  // pestaña nueva), retrocede antes de buscar.
+  async function prepararBusqueda(page) {
+    const enHistorico = await marcarHojas(page).catch(() => null);
+    if (enHistorico) {
+      console.log(
+        "La pestaña quedó en el Histórico del paciente anterior. Volviendo atrás..."
+      );
+      await page.goBack().catch(() => {});
+      await page.waitForLoadState("domcontentloaded").catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+    return buscarCuadro(page);
+  }
+
+  // --- Filtro "Row text contains '...'" que deja la búsqueda anterior ---
+  // La página activa un filtro con el documento buscado. Si no se borra con la
+  // X, la siguiente búsqueda no muestra resultados. Devuelve:
+  //   { habia: false }                 → no había filtro
+  //   { habia: true, limpio: true }    → había filtro y se borró
+  //   { habia: true, limpio: false }   → había filtro y no pude borrarlo
+  async function limpiarFiltro(page) {
+    const SELECCION_FUERTE =
+      '[title*="clear" i], [title*="close" i], [title*="remove" i], [title*="delete" i], ' +
+      '[title*="quitar" i], [title*="borrar" i], ' +
+      '[aria-label*="clear" i], [aria-label*="close" i], [aria-label*="remove" i], ' +
+      '[aria-label*="quitar" i], [aria-label*="borrar" i], ' +
+      '[alt*="clear" i], [alt*="delete" i], [alt*="borrar" i], ' +
+      '[src*="clear" i], [src*="close" i], [src*="delete" i], [src*="remove" i], [src*="trash" i]';
+    const SELECCION_DEBIL =
+      '[class*="clear" i], [class*="remove" i], [class*="delete" i], [class*="close" i], ' +
+      '[class*="trash" i]';
+
+    const hayBarra = async (marco) =>
+      (await marco.getByText(/Row text contains/i).count().catch(() => 1)) > 0;
+
+    for (const marco of page.frames()) {
+      let barra = false;
+      try {
+        barra = await hayBarra(marco);
+      } catch {
+        continue;
+      }
+      if (!barra) continue;
+
+      console.log("  Apareció el filtro del paciente anterior ('Row text contains'...).");
+
+      // Busca el ícono de borrar (X) dentro de la misma barra del filtro.
+      const marcado = await marco
+        .evaluate(
+          ({ fuerte, debil }) => {
+            const hojas = [...document.querySelectorAll("*")].filter(
+              (e) => e.children.length === 0 && /row text contains/i.test(e.textContent || "")
+            );
+            if (!hojas.length) return { ok: false };
+            const marcar = (cont, sel) => {
+              for (const el of cont.querySelectorAll(sel)) {
+                if (el.children.length > 1) continue; // evita contenedores grandes
+                el.setAttribute("data-pw-clear", "1");
+                return true;
+              }
+              return false;
+            };
+            let cont = hojas[0];
+            for (let i = 0; i < 6 && cont; i++) {
+              if (marcar(cont, fuerte) || marcar(cont, debil)) return { ok: true };
+              cont = cont.parentElement;
+            }
+            return { ok: false };
+          },
+          { fuerte: SELECCION_FUERTE, debil: SELECCION_DEBIL }
+        )
+        .catch(() => ({ ok: false }));
+
+      if (marcado.ok) {
+        const x = marco.locator("[data-pw-clear]").first();
+        await x.click({ timeout: 5000 }).catch(() => {});
+        const limite = Date.now() + 5000;
+        while (Date.now() < limite) {
+          if (!(await hayBarra(marco))) return { habia: true, limpio: true };
+          await page.waitForTimeout(300);
+        }
+        console.log("  El filtro sigue en pantalla después de hacer clic en la X.");
+      }
+
+      // Respaldo: recargar la página borra el filtro (estado del cliente).
+      console.log("  Respaldo: recargando la página para quitar el filtro...");
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(2500);
+      for (const m of page.frames()) {
+        try {
+          if (await hayBarra(m)) return { habia: true, limpio: false };
+        } catch {}
+      }
+      return { habia: true, limpio: true };
+    }
+    return { habia: false };
+  }
+
   // ---------- Proceso completo de UN paciente ----------
 
-  async function procesarPaciente(page, primera) {
+  async function procesarPaciente(page) {
     // --- Cuadro de búsqueda ---
+    // Siempre se comprueba en qué pantalla quedamos (resultados del paciente
+    // anterior, Histórico, etc.). Si no es la de búsqueda, se vuelve a entrar
+    // por el menú. Así el segundo paciente no parte de una pantalla sucia.
     console.log("Buscando el cuadro de búsqueda...");
-    let cuadro = null;
-    if (!primera) {
-      // Si seguimos en la pantalla de Pacientes, se reutiliza.
+    // 1) Si quedamos en el Histórico, volver atrás.
+    let cuadro = await prepararBusqueda(page);
+    // 2) Borrar el filtro "Row text contains '...'" del paciente anterior.
+    const filtro = await limpiarFiltro(page);
+    if (filtro.habia) {
+      if (filtro.limpio) {
+        console.log("  Filtro del paciente anterior borrado.");
+        await page.waitForTimeout(800);
+      } else {
+        throw new Error(
+          "No pude borrar el filtro 'Row text contains' del paciente anterior. Revisa la página a mano y vuelve a intentarlo."
+        );
+      }
+    }
+    // 3) Localizar el cuadro (tras un reload puede haber cambiado).
+    if (!cuadro || filtro.limpio) {
       cuadro = await buscarCuadro(page);
     }
     if (!cuadro) {
@@ -623,14 +793,17 @@ const MODO_CLIC = "dos";
       }
     }
     const firmaDoc = hash(documento);
-
-    // Huella de la pantalla ANTES de buscar, para saber cuándo cambian los resultados.
-    const firmaAntes = await firmaPanel(page);
+    const docPedido = documento; // se guarda solo en memoria para validar la fila
 
     await cuadro.click();
     await cuadro.fill(documento);
     documento = "";
     console.log("Documento escrito en el cuadro. Buscando...");
+
+    // Huella DESPUÉS de escribir: así lo que debe cambiar al pulsar Go son los
+    // RESULTADOS, no el llenado del cuadro (que habilita el botón y cambiaba
+    // la firma en falso).
+    const firmaAntes = await firmaPanel(page);
 
     const botonGo = await unicoVisible(
       page.getByRole("button", { name: "Go", exact: true }),
@@ -646,25 +819,23 @@ const MODO_CLIC = "dos";
     await page.waitForLoadState("domcontentloaded");
     await page.waitForTimeout(2000);
 
-    // Protección: si el documento es distinto al anterior, los resultados deben
-    // haber cambiado. Así no se hace clic sobre la fila del paciente anterior.
-    if (firmaDoc !== ultimaFirmaDocumento) {
-      let cambio = false;
-      const limiteCambio = Date.now() + 15000;
-      while (Date.now() < limiteCambio) {
-        if ((await firmaPanel(page)) !== firmaAntes) {
-          cambio = true;
-          break;
-        }
-        await page.waitForTimeout(500);
+    // Protección: tras pulsar Go, los resultados SIEMPRE deben cambiar. Si no
+    // cambian, es que la búsqueda no se ejecutó (filtro viejo, cuadro malo…).
+    let cambio = false;
+    const limiteCambio = Date.now() + 15000;
+    while (Date.now() < limiteCambio) {
+      if ((await firmaPanel(page)) !== firmaAntes) {
+        cambio = true;
+        break;
       }
-      if (!cambio) {
-        throw new Error(
-          "Los resultados no cambiaron tras la búsqueda. No hago clic para no abrir el paciente equivocado."
-        );
-      }
-      await esperarCambioYEstabilidad(page, firmaAntes);
+      await page.waitForTimeout(500);
     }
+    if (!cambio) {
+      throw new Error(
+        "Los resultados no cambiaron tras la búsqueda. No hago clic para no abrir el paciente equivocado."
+      );
+    }
+    await esperarCambioYEstabilidad(page, firmaAntes);
     ultimaFirmaDocumento = firmaDoc;
 
     // --- Ubicar la columna "Histórico de Atenciones" ---
@@ -675,6 +846,7 @@ const MODO_CLIC = "dos";
       15000
     );
     if (!encabezado) {
+      await listarTextosVisibles(page);
       throw new Error(
         "No encontré un único encabezado 'Histórico de Atenciones' visible. ¿Quedó la tabla de resultados en pantalla?"
       );
@@ -706,8 +878,16 @@ const MODO_CLIC = "dos";
       );
     }
 
-    // --- Ícono dentro de la celda ---
+    // --- Verificar que la fila corresponde AL DOCUMENTO pedido ---
     const fila = filas.first();
+    const textoFila = await fila.innerText().catch(() => "");
+    const digitosFila = textoFila.replace(/\D+/g, "");
+    if (!digitosFila.includes(docPedido)) {
+      await listarTextosVisibles(page);
+      throw new Error(
+        "La fila en pantalla NO corresponde al documento pedido. No hago clic para no abrir el paciente equivocado."
+      );
+    }
     const celda = fila.locator("> td").nth(indiceColumna);
 
     const candidatosIcono = [
@@ -842,10 +1022,15 @@ const MODO_CLIC = "dos";
     }
 
     // --- FASE 2: descarga ---
-    const dirSalida = path.join(
-      CARPETA_BASE,
-      "paciente_" + new Date().toISOString().replace(/[:.]/g, "-")
-    );
+    // Carpeta "Paciente_<número de cédula>". (Windows no permite ":" en nombres
+    // de carpeta, por eso se usa "_".)
+    let dirSalida = path.join(CARPETA_BASE, `Paciente_${docPedido}`);
+    if (fs.existsSync(dirSalida)) {
+      // Si ya existe (2da descarga del mismo paciente), no se pisan los PDFs:
+      // se crea una subcarpeta con la fecha y hora.
+      const marca = new Date().toISOString().replace(/[:.]/g, "-");
+      dirSalida = path.join(dirSalida, marca);
+    }
     fs.mkdirSync(dirSalida, { recursive: true });
     console.log(`\nFASE 2: descargando en ${dirSalida}`);
 
