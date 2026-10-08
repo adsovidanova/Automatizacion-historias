@@ -745,7 +745,7 @@ const MODO_CLIC = "dos";
 
   // ---------- Proceso completo de UN paciente ----------
 
-  async function procesarPaciente(page) {
+  async function procesarPaciente(page, documento) {
     // --- Cuadro de búsqueda ---
     // Siempre se comprueba en qué pantalla quedamos (resultados del paciente
     // anterior, Histórico, etc.). Si no es la de búsqueda, se vuelve a entrar
@@ -780,18 +780,6 @@ const MODO_CLIC = "dos";
       );
     }
 
-    // --- Pedir el documento por terminal (no se imprime) ---
-    let documento = "";
-    while (!/^\d{4,15}$/.test(documento)) {
-      documento = (
-        await preguntar(
-          "Escribe el número de documento (solo dígitos, de un registro autorizado) y pulsa Enter:\n"
-        )
-      ).trim();
-      if (!/^\d{4,15}$/.test(documento)) {
-        console.log("Formato no válido. Usa solo dígitos (entre 4 y 15).");
-      }
-    }
     const firmaDoc = hash(documento);
     const docPedido = documento; // se guarda solo en memoria para validar la fila
 
@@ -1067,7 +1055,37 @@ const MODO_CLIC = "dos";
     );
   }
 
-  // ---------- Flujo principal (bucle de pacientes) ----------
+  // ---------- Pedir un LOTE de documentos (hasta 10) ----------
+
+  const MAX_PACIENTES_POR_LOTE = 10;
+
+  async function pedirLoteDocumentos() {
+    const docs = [];
+    console.log(
+      `\nEscribe hasta ${MAX_PACIENTES_POR_LOTE} números de documento (solo dígitos, 4-15).\n` +
+        `Uno por línea, o separados por espacios/comas. Línea vacía = terminar.`
+    );
+    while (docs.length < MAX_PACIENTES_POR_LOTE) {
+      const linea = (
+        await preguntar(
+          `[${docs.length + 1}/${MAX_PACIENTES_POR_LOTE}] Documento (o Enter para terminar): `
+        )
+      ).trim();
+      if (!linea) break;
+      const partes = linea.split(/[\s,;]+/).filter(Boolean);
+      for (const p of partes) {
+        if (/^\d{4,15}$/.test(p)) {
+          docs.push(p);
+          if (docs.length >= MAX_PACIENTES_POR_LOTE) break;
+        } else {
+          console.log(`  "${p}" no es válido (solo dígitos, 4-15). Se ignora.`);
+        }
+      }
+    }
+    return docs;
+  }
+
+  // ---------- Flujo principal (lotes de pacientes) ----------
 
   try {
     await paginaInicial.goto(URL_INICIAL);
@@ -1082,25 +1100,37 @@ const MODO_CLIC = "dos";
     const page = paginas[paginas.length - 1];
     await page.bringToFront();
 
-    let primera = true;
     let seguir = true;
     while (seguir) {
-      const abiertasAntes = new Set(context.pages());
-
-      try {
-        await procesarPaciente(page, primera);
-      } catch (e) {
-        console.log("No se pudo completar este paciente:", msgDetalle(e));
+      // --- Pedir el lote de documentos (hasta 10) ---
+      const lote = await pedirLoteDocumentos();
+      if (lote.length === 0) {
+        console.log("No se ingresó ningún documento. Fin.");
+        break;
       }
-      primera = false;
+      console.log(
+        `\n=== LOTE: ${lote.length} paciente(s). Se procesarán en automático, uno tras otro. ===`
+      );
 
-      // Cierra las pestañas que se abrieron durante este paciente (Histórico, etc.).
-      for (const p of context.pages()) {
-        if (!abiertasAntes.has(p)) await p.close().catch(() => {});
+      // --- Procesar cada paciente del lote en automático ---
+      for (let i = 0; i < lote.length; i++) {
+        const abiertasAntes = new Set(context.pages());
+        console.log(`\n----- PACIENTE ${i + 1} DE ${lote.length} -----`);
+
+        try {
+          await procesarPaciente(page, lote[i]);
+        } catch (e) {
+          console.log("No se pudo completar este paciente:", msgDetalle(e));
+        }
+
+        // Cierra las pestañas que se abrieron durante este paciente (Histórico, etc.).
+        for (const p of context.pages()) {
+          if (!abiertasAntes.has(p)) await p.close().catch(() => {});
+        }
+        await page.bringToFront().catch(() => {});
       }
-      await page.bringToFront().catch(() => {});
 
-      const otra = (await preguntar("\n¿Consultar otro paciente? (s/n): "))
+      const otra = (await preguntar("\n¿Procesar otro lote de pacientes? (s/n): "))
         .trim()
         .toLowerCase();
       if (otra !== "s") seguir = false;
